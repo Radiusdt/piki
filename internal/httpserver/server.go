@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -38,8 +39,11 @@ type Server struct {
 	advertiserService *dsp.AdvertiserService
 	adGroupService    *dsp.AdGroupService
 	creativeService   *dsp.CreativeService
+	sourceService     *dsp.SourceService
 	reportingService  *dsp.ReportingService
 	pacingEngine      dsp.PacingEngine
+	trackingService   *dsp.TrackingService
+	postbackHandler   *dsp.PostbackHandler
 	logger            *zap.Logger
 	config            *config.Config
 	metrics           *metrics.Metrics
@@ -51,15 +55,18 @@ func NewServer(deps *Dependencies) http.Handler {
 	var cRepo storage.CampaignRepo
 	var advRepo storage.AdvertiserRepo
 	var eventStore storage.EventStore
+	var sourceRepo storage.SourceRepo
 
 	if deps.DB != nil {
 		cRepo = storage.NewPostgresCampaignRepo(deps.DB.Pool)
 		advRepo = storage.NewPostgresAdvertiserRepo(deps.DB.Pool)
 		eventStore = storage.NewPostgresEventStore(deps.DB.Pool)
+		sourceRepo = storage.NewPostgresSourceRepo(deps.DB.Pool)
 	} else {
 		cRepo = storage.NewInMemoryCampaignRepo()
 		advRepo = storage.NewInMemoryAdvertiserRepo()
 		eventStore = storage.NewInMemoryEventStore()
+		sourceRepo = storage.NewInMemorySourceRepo()
 	}
 
 	agRepo := storage.NewInMemoryAdGroupRepo()
@@ -96,11 +103,31 @@ func NewServer(deps *Dependencies) http.Handler {
 
 	// Initialize services
 	cSvc := dsp.NewCampaignService(cRepo)
-	bSvc := dsp.NewBidService(cRepo, pacer, targetingEngine, deps.Metrics)
+	bSvc := dsp.NewBidService(cRepo, pacer, targetingEngine, deps.Metrics, deps.Config.Tracking.BaseURL)
 	eSvc := dsp.NewEventService(eventStore)
 	advSvc := dsp.NewAdvertiserService(advRepo)
 	agSvc := dsp.NewAdGroupService(agRepo)
 	crSvc := dsp.NewCreativeService(crRepo)
+	srcSvc := dsp.NewSourceService(sourceRepo)
+
+	// Initialize tracking service
+	trackingSvc := dsp.NewTrackingService(
+		eventStore,
+		cRepo,
+		targetingEngine,
+		deps.Config.Tracking.BaseURL,
+		deps.Logger,
+		deps.Metrics,
+	)
+
+	// Initialize postback handler
+	postbackHandler := dsp.NewPostbackHandler(
+		eventStore,
+		sourceRepo,
+		cRepo,
+		deps.Logger,
+		deps.Metrics,
+	)
 
 	var reportingSvc *dsp.ReportingService
 	if deps.Redis != nil {
@@ -114,8 +141,11 @@ func NewServer(deps *Dependencies) http.Handler {
 		advertiserService: advSvc,
 		adGroupService:    agSvc,
 		creativeService:   crSvc,
+		sourceService:     srcSvc,
 		reportingService:  reportingSvc,
 		pacingEngine:      pacer,
+		trackingService:   trackingSvc,
+		postbackHandler:   postbackHandler,
 		logger:            deps.Logger,
 		config:            deps.Config,
 		metrics:           deps.Metrics,
@@ -131,54 +161,95 @@ func NewServer(deps *Dependencies) http.Handler {
 		mux.Handle(deps.Config.Metrics.Path, metrics.Handler())
 	}
 
+	// =============================================
 	// OpenRTB endpoints
+	// =============================================
 	mux.HandleFunc("/openrtb2/bid", s.handleBid)
 	mux.HandleFunc("/openrtb2/win", s.handleWinNotice)
 	mux.HandleFunc("/openrtb2/loss", s.handleLossNotice)
 
-	// Campaign management
-	mux.HandleFunc("/campaigns", s.handleCampaigns)
-	mux.HandleFunc("/campaigns/", s.handleCampaignByID)
+	// =============================================
+	// Tracking endpoints (Click & View)
+	// =============================================
+	mux.HandleFunc("/track/click", s.handleTrackClick)
+	mux.HandleFunc("/track/view", s.handleTrackView)
+	mux.HandleFunc("/track/event", s.handleTrackEvent)
 
-	// Advertisers
-	mux.HandleFunc("/advertisers", s.handleAdvertisers)
-	mux.HandleFunc("/advertisers/", s.handleAdvertiserByID)
+	// =============================================
+	// Postback endpoints (from MMPs)
+	// =============================================
+	mux.HandleFunc("/postback", s.handlePostback)
+	mux.HandleFunc("/postback/appsflyer", s.handlePostbackAppsFlyer)
+	mux.HandleFunc("/postback/adjust", s.handlePostbackAdjust)
+	mux.HandleFunc("/postback/singular", s.handlePostbackSingular)
 
-	// Ad groups
-	mux.HandleFunc("/adgroups", s.handleAdGroups)
-	mux.HandleFunc("/adgroups/", s.handleAdGroupByID)
+	// =============================================
+	// S2S endpoints (for direct partners)
+	// =============================================
+	mux.HandleFunc("/s2s/", s.handleS2S)
 
-	// Creatives
-	mux.HandleFunc("/creatives", s.handleCreatives)
-	mux.HandleFunc("/creatives/", s.handleCreativeByID)
-	mux.HandleFunc("/creatives/upload", s.handleCreativeUpload)
+	// =============================================
+	// Admin API - Campaigns
+	// =============================================
+	mux.HandleFunc("/api/campaigns", s.handleCampaigns)
+	mux.HandleFunc("/api/campaigns/", s.handleCampaignByID)
 
+	// =============================================
+	// Admin API - Advertisers
+	// =============================================
+	mux.HandleFunc("/api/advertisers", s.handleAdvertisers)
+	mux.HandleFunc("/api/advertisers/", s.handleAdvertiserByID)
+
+	// =============================================
+	// Admin API - Sources
+	// =============================================
+	mux.HandleFunc("/api/sources/s2s", s.handleS2SSources)
+	mux.HandleFunc("/api/sources/s2s/", s.handleS2SSourceByID)
+	mux.HandleFunc("/api/sources/rtb", s.handleRTBSources)
+	mux.HandleFunc("/api/sources/rtb/", s.handleRTBSourceByID)
+
+	// =============================================
+	// Admin API - Ad Groups
+	// =============================================
+	mux.HandleFunc("/api/adgroups", s.handleAdGroups)
+	mux.HandleFunc("/api/adgroups/", s.handleAdGroupByID)
+
+	// =============================================
+	// Admin API - Creatives
+	// =============================================
+	mux.HandleFunc("/api/creatives", s.handleCreatives)
+	mux.HandleFunc("/api/creatives/", s.handleCreativeByID)
+	mux.HandleFunc("/api/creatives/upload", s.handleCreativeUpload)
+
+	// =============================================
 	// Reporting
-	mux.HandleFunc("/reports/campaigns", s.handleCampaignReports)
-	mux.HandleFunc("/reports/line-items", s.handleLineItemReports)
-	mux.HandleFunc("/reports/time-series", s.handleTimeSeriesReport)
+	// =============================================
+	mux.HandleFunc("/api/reports/campaigns", s.handleCampaignReports)
+	mux.HandleFunc("/api/reports/sources", s.handleSourceReports)
+	mux.HandleFunc("/api/reports/geo", s.handleGeoReports)
+	mux.HandleFunc("/api/reports/time-series", s.handleTimeSeriesReport)
 
 	// Stats (backward compatibility)
-	mux.HandleFunc("/stats", s.handleStats)
+	mux.HandleFunc("/api/stats", s.handleStats)
 
 	// Pacing
-	mux.HandleFunc("/pacing/", s.handlePacingStats)
-
-	// Events
-	mux.HandleFunc("/events/click", s.handleClick)
-	mux.HandleFunc("/events/s2s/conversion", s.handleConversion)
+	mux.HandleFunc("/api/pacing/", s.handlePacingStats)
 
 	return mux
 }
 
-// ---- Health Check ----
+// =============================================
+// Health Check
+// =============================================
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+	json.NewEncoder(w).Encode(map[string]string{"status": "ok", "version": "1.0.0"})
 }
 
-// ---- OpenRTB Bid ----
+// =============================================
+// OpenRTB Bid
+// =============================================
 
 func (s *Server) handleBid(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
@@ -210,54 +281,45 @@ func (s *Server) handleBid(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(resp)
+	json.NewEncoder(w).Encode(resp)
 }
 
-// ---- Win/Loss Notifications ----
-
 func (s *Server) handleWinNotice(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet && r.Method != http.MethodPost {
-		s.errorResponse(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
 	q := r.URL.Query()
 	campaignID := q.Get("campaign_id")
 	lineItemID := q.Get("line_item_id")
+	creativeID := q.Get("creative_id")
+	impID := q.Get("imp_id")
 	priceStr := q.Get("price")
 
+	price := 0.0
+	if priceStr != "" {
+		fmt.Sscanf(priceStr, "%f", &price)
+	}
+
 	s.logger.Info("win notice",
-		zap.String("imp_id", q.Get("imp_id")),
-		zap.String("price", priceStr),
-		zap.String("bid_id", q.Get("bid_id")),
+		zap.String("imp_id", impID),
+		zap.Float64("price", price),
 		zap.String("campaign_id", campaignID),
-		zap.String("line_item_id", lineItemID),
 	)
 
-	// Record win in metrics
 	if s.metrics != nil && campaignID != "" {
-		price := 0.0
-		fmt.Sscanf(priceStr, "%f", &price)
 		s.metrics.RecordWin(campaignID, lineItemID, price)
 	}
 
-	w.Header().Set("Content-Type", "text/plain")
+	// Log impression
+	s.trackingService.RegisterWin(r.Context(), impID, campaignID, lineItemID, creativeID, price)
+
+	w.WriteHeader(http.StatusOK)
 	w.Write([]byte("OK"))
 }
 
 func (s *Server) handleLossNotice(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet && r.Method != http.MethodPost {
-		s.errorResponse(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
 	q := r.URL.Query()
 	campaignID := q.Get("campaign_id")
 	reason := q.Get("reason")
 
 	s.logger.Debug("loss notice",
-		zap.String("imp_id", q.Get("imp_id")),
-		zap.String("price", q.Get("price")),
 		zap.String("campaign_id", campaignID),
 		zap.String("reason", reason),
 	)
@@ -266,18 +328,230 @@ func (s *Server) handleLossNotice(w http.ResponseWriter, r *http.Request) {
 		s.metrics.RecordLoss(campaignID, reason)
 	}
 
-	w.Header().Set("Content-Type", "text/plain")
-	w.Write([]byte("OK"))
+	w.WriteHeader(http.StatusOK)
 }
 
-// ---- Campaigns CRUD ----
+// =============================================
+// Tracking Endpoints
+// =============================================
+
+func (s *Server) handleTrackClick(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+
+	campaignID := q.Get("cid")
+	creativeID := q.Get("cr")
+	lineItemID := q.Get("li")
+	sourceID := q.Get("src")
+	sourceType := q.Get("st")
+	impressionID := q.Get("imp")
+	gaid := q.Get("gaid")
+	idfa := q.Get("idfa")
+
+	if campaignID == "" {
+		s.errorResponse(w, "missing campaign_id", http.StatusBadRequest)
+		return
+	}
+
+	// Get sub parameters
+	sub1 := q.Get("sub1")
+	sub2 := q.Get("sub2")
+	sub3 := q.Get("sub3")
+	sub4 := q.Get("sub4")
+	sub5 := q.Get("sub5")
+
+	// Register click and get MMP redirect URL
+	redirectURL, err := s.trackingService.RegisterClick(
+		r.Context(),
+		campaignID, creativeID, lineItemID,
+		sourceType, sourceID, impressionID,
+		gaid, idfa,
+		getClientIP(r), r.UserAgent(),
+		sub1, sub2, sub3, sub4, sub5,
+	)
+	if err != nil {
+		s.logger.Error("click registration failed", zap.Error(err))
+		s.errorResponse(w, "click registration failed", http.StatusInternalServerError)
+		return
+	}
+
+	if s.metrics != nil {
+		s.metrics.RecordClick(campaignID, lineItemID)
+	}
+
+	// Redirect to MMP Click URL
+	if redirectURL != "" {
+		http.Redirect(w, r, redirectURL, http.StatusFound)
+		return
+	}
+
+	// No redirect - return OK
+	w.WriteHeader(http.StatusOK)
+}
+
+func (s *Server) handleTrackView(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+
+	campaignID := q.Get("cid")
+	creativeID := q.Get("cr")
+	lineItemID := q.Get("li")
+	sourceID := q.Get("src")
+	sourceType := q.Get("st")
+	impressionID := q.Get("imp")
+	gaid := q.Get("gaid")
+	idfa := q.Get("idfa")
+
+	// Register view
+	s.trackingService.RegisterView(
+		r.Context(),
+		campaignID, creativeID, lineItemID,
+		sourceType, sourceID, impressionID,
+		gaid, idfa, getClientIP(r),
+	)
+
+	// Return 1x1 transparent pixel
+	w.Header().Set("Content-Type", "image/gif")
+	w.Header().Set("Cache-Control", "no-cache, no-store")
+	w.Header().Set("Pragma", "no-cache")
+	w.Write(transparentPixel)
+}
+
+func (s *Server) handleTrackEvent(w http.ResponseWriter, r *http.Request) {
+	// Custom event tracking
+	q := r.URL.Query()
+	eventName := q.Get("event")
+	clickID := q.Get("click_id")
+
+	s.logger.Debug("event tracked",
+		zap.String("event", eventName),
+		zap.String("click_id", clickID),
+	)
+
+	w.WriteHeader(http.StatusOK)
+}
+
+// =============================================
+// Postback Endpoints
+// =============================================
+
+func (s *Server) handlePostback(w http.ResponseWriter, r *http.Request) {
+	result, err := s.postbackHandler.HandleGeneric(r.Context(), r)
+	if err != nil {
+		s.logger.Error("postback error", zap.Error(err))
+	}
+	s.jsonResponse(w, result)
+}
+
+func (s *Server) handlePostbackAppsFlyer(w http.ResponseWriter, r *http.Request) {
+	result, err := s.postbackHandler.HandleAppsFlyer(r.Context(), r)
+	if err != nil {
+		s.logger.Error("appsflyer postback error", zap.Error(err))
+	}
+	s.jsonResponse(w, result)
+}
+
+func (s *Server) handlePostbackAdjust(w http.ResponseWriter, r *http.Request) {
+	result, err := s.postbackHandler.HandleAdjust(r.Context(), r)
+	if err != nil {
+		s.logger.Error("adjust postback error", zap.Error(err))
+	}
+	s.jsonResponse(w, result)
+}
+
+func (s *Server) handlePostbackSingular(w http.ResponseWriter, r *http.Request) {
+	result, err := s.postbackHandler.HandleSingular(r.Context(), r)
+	if err != nil {
+		s.logger.Error("singular postback error", zap.Error(err))
+	}
+	s.jsonResponse(w, result)
+}
+
+// =============================================
+// S2S Endpoints
+// =============================================
+
+func (s *Server) handleS2S(w http.ResponseWriter, r *http.Request) {
+	parts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
+	if len(parts) < 3 {
+		s.errorResponse(w, "invalid path", http.StatusBadRequest)
+		return
+	}
+
+	sourceName := parts[1]
+	action := parts[2]
+
+	switch action {
+	case "ad":
+		s.handleS2SAd(w, r, sourceName)
+	case "click":
+		s.handleS2SClick(w, r, sourceName)
+	default:
+		s.errorResponse(w, "unknown action", http.StatusBadRequest)
+	}
+}
+
+func (s *Server) handleS2SAd(w http.ResponseWriter, r *http.Request, sourceName string) {
+	// Get source
+	source, err := s.sourceService.GetS2SSourceByName(r.Context(), sourceName)
+	if err != nil || source == nil {
+		s.jsonResponse(w, map[string]interface{}{"success": false, "error": "source not found"})
+		return
+	}
+
+	// Parse request
+	q := r.URL.Query()
+	country := strings.ToUpper(q.Get("country"))
+	os := strings.ToLower(q.Get("os"))
+	gaid := q.Get("gaid")
+	if gaid == "" {
+		gaid = q.Get("idfa")
+	}
+
+	// Find matching campaign
+	campaign, creative, err := s.sourceService.FindCampaignForSource(r.Context(), source.ID, country, os)
+	if err != nil || campaign == nil {
+		s.jsonResponse(w, map[string]interface{}{"success": false, "error": "no ad available"})
+		return
+	}
+
+	// Build tracking URLs
+	clickURL := fmt.Sprintf("%s/track/click?cid=%s&cr=%s&src=%s&st=s2s&gaid=%s&sub1=%s&sub2=%s&sub3=%s",
+		s.config.Tracking.BaseURL, campaign.ID, creative.ID, source.ID,
+		gaid, q.Get("sub1"), q.Get("sub2"), q.Get("sub3"))
+
+	viewURL := fmt.Sprintf("%s/track/view?cid=%s&cr=%s&src=%s&st=s2s&gaid=%s",
+		s.config.Tracking.BaseURL, campaign.ID, creative.ID, source.ID, gaid)
+
+	s.jsonResponse(w, map[string]interface{}{
+		"success":     true,
+		"campaign_id": campaign.ID,
+		"app_bundle":  campaign.AppBundle,
+		"creative": map[string]interface{}{
+			"id":   creative.ID,
+			"type": creative.Format,
+			"url":  creative.AdmTemplate,
+			"w":    creative.W,
+			"h":    creative.H,
+		},
+		"click_url": clickURL,
+		"view_url":  viewURL,
+		"payout":    source.DefaultPayout,
+	})
+}
+
+func (s *Server) handleS2SClick(w http.ResponseWriter, r *http.Request, sourceName string) {
+	// This is the same as handleTrackClick but with source validation
+	s.handleTrackClick(w, r)
+}
+
+// =============================================
+// Admin API - Campaigns
+// =============================================
 
 func (s *Server) handleCampaigns(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
 		list, err := s.campaignService.ListCampaigns()
 		if err != nil {
-			s.logger.Error("failed to list campaigns", zap.Error(err))
 			s.errorResponse(w, "failed to list", http.StatusInternalServerError)
 			return
 		}
@@ -301,7 +575,7 @@ func (s *Server) handleCampaigns(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleCampaignByID(w http.ResponseWriter, r *http.Request) {
-	id := strings.TrimPrefix(r.URL.Path, "/campaigns/")
+	id := strings.TrimPrefix(r.URL.Path, "/api/campaigns/")
 	if id == "" {
 		http.NotFound(w, r)
 		return
@@ -311,12 +585,24 @@ func (s *Server) handleCampaignByID(w http.ResponseWriter, r *http.Request) {
 	case http.MethodGet:
 		c, err := s.campaignService.GetCampaign(id)
 		if err != nil {
-			s.logger.Error("failed to get campaign", zap.Error(err))
 			s.errorResponse(w, "error: "+err.Error(), http.StatusInternalServerError)
 			return
 		}
 		if c == nil {
 			http.NotFound(w, r)
+			return
+		}
+		s.jsonResponse(w, c)
+
+	case http.MethodPut:
+		var c models.Campaign
+		if err := json.NewDecoder(r.Body).Decode(&c); err != nil {
+			s.errorResponse(w, "invalid json", http.StatusBadRequest)
+			return
+		}
+		c.ID = id
+		if err := s.campaignService.UpsertCampaign(&c); err != nil {
+			s.errorResponse(w, "failed to save: "+err.Error(), http.StatusBadRequest)
 			return
 		}
 		s.jsonResponse(w, c)
@@ -329,7 +615,9 @@ func (s *Server) handleCampaignByID(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// ---- Advertisers CRUD ----
+// =============================================
+// Admin API - Advertisers
+// =============================================
 
 func (s *Server) handleAdvertisers(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
@@ -359,7 +647,7 @@ func (s *Server) handleAdvertisers(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleAdvertiserByID(w http.ResponseWriter, r *http.Request) {
-	id := strings.TrimPrefix(r.URL.Path, "/advertisers/")
+	id := strings.TrimPrefix(r.URL.Path, "/api/advertisers/")
 	if id == "" {
 		http.NotFound(w, r)
 		return
@@ -383,7 +671,117 @@ func (s *Server) handleAdvertiserByID(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// ---- Ad Groups CRUD ----
+// =============================================
+// Admin API - Sources
+// =============================================
+
+func (s *Server) handleS2SSources(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		list, err := s.sourceService.ListS2SSources(r.Context())
+		if err != nil {
+			s.errorResponse(w, "failed to list", http.StatusInternalServerError)
+			return
+		}
+		s.jsonResponse(w, list)
+
+	case http.MethodPost:
+		var src models.S2SSource
+		if err := json.NewDecoder(r.Body).Decode(&src); err != nil {
+			s.errorResponse(w, "invalid json", http.StatusBadRequest)
+			return
+		}
+		if err := s.sourceService.UpsertS2SSource(r.Context(), &src); err != nil {
+			s.errorResponse(w, "failed to save: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+		s.jsonResponse(w, src)
+
+	default:
+		s.errorResponse(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+func (s *Server) handleS2SSourceByID(w http.ResponseWriter, r *http.Request) {
+	id := strings.TrimPrefix(r.URL.Path, "/api/sources/s2s/")
+	if id == "" {
+		http.NotFound(w, r)
+		return
+	}
+
+	switch r.Method {
+	case http.MethodGet:
+		src, err := s.sourceService.GetS2SSource(r.Context(), id)
+		if err != nil {
+			s.errorResponse(w, "error: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+		if src == nil {
+			http.NotFound(w, r)
+			return
+		}
+		s.jsonResponse(w, src)
+
+	default:
+		s.errorResponse(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+func (s *Server) handleRTBSources(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		list, err := s.sourceService.ListRTBSources(r.Context())
+		if err != nil {
+			s.errorResponse(w, "failed to list", http.StatusInternalServerError)
+			return
+		}
+		s.jsonResponse(w, list)
+
+	case http.MethodPost:
+		var src models.RTBSource
+		if err := json.NewDecoder(r.Body).Decode(&src); err != nil {
+			s.errorResponse(w, "invalid json", http.StatusBadRequest)
+			return
+		}
+		if err := s.sourceService.UpsertRTBSource(r.Context(), &src); err != nil {
+			s.errorResponse(w, "failed to save: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+		s.jsonResponse(w, src)
+
+	default:
+		s.errorResponse(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+func (s *Server) handleRTBSourceByID(w http.ResponseWriter, r *http.Request) {
+	id := strings.TrimPrefix(r.URL.Path, "/api/sources/rtb/")
+	if id == "" {
+		http.NotFound(w, r)
+		return
+	}
+
+	switch r.Method {
+	case http.MethodGet:
+		src, err := s.sourceService.GetRTBSource(r.Context(), id)
+		if err != nil {
+			s.errorResponse(w, "error: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+		if src == nil {
+			http.NotFound(w, r)
+			return
+		}
+		s.jsonResponse(w, src)
+
+	default:
+		s.errorResponse(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+// =============================================
+// Admin API - Ad Groups
+// =============================================
 
 func (s *Server) handleAdGroups(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
@@ -420,7 +818,7 @@ func (s *Server) handleAdGroups(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleAdGroupByID(w http.ResponseWriter, r *http.Request) {
-	id := strings.TrimPrefix(r.URL.Path, "/adgroups/")
+	id := strings.TrimPrefix(r.URL.Path, "/api/adgroups/")
 	if id == "" {
 		http.NotFound(w, r)
 		return
@@ -444,7 +842,9 @@ func (s *Server) handleAdGroupByID(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// ---- Creatives CRUD ----
+// =============================================
+// Admin API - Creatives
+// =============================================
 
 func (s *Server) handleCreatives(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
@@ -479,7 +879,7 @@ func (s *Server) handleCreatives(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleCreativeByID(w http.ResponseWriter, r *http.Request) {
-	id := strings.TrimPrefix(r.URL.Path, "/creatives/")
+	id := strings.TrimPrefix(r.URL.Path, "/api/creatives/")
 	if id == "" || id == "upload" {
 		http.NotFound(w, r)
 		return
@@ -527,12 +927,10 @@ func (s *Server) handleCreativeUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	baseName := header.Filename
-	destPath := filepath.Join(uploadDir, baseName)
-
+	destPath := filepath.Join(uploadDir, header.Filename)
 	if _, err := os.Stat(destPath); err == nil {
 		for i := 1; ; i++ {
-			suffixName := filepath.Join(uploadDir, fmt.Sprintf("%d_%s", i, baseName))
+			suffixName := filepath.Join(uploadDir, fmt.Sprintf("%d_%s", i, header.Filename))
 			if _, err := os.Stat(suffixName); os.IsNotExist(err) {
 				destPath = suffixName
 				break
@@ -555,14 +953,11 @@ func (s *Server) handleCreativeUpload(w http.ResponseWriter, r *http.Request) {
 	s.jsonResponse(w, map[string]string{"path": "/" + destPath})
 }
 
-// ---- Reporting ----
+// =============================================
+// Reporting
+// =============================================
 
 func (s *Server) handleCampaignReports(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet && r.Method != http.MethodPost {
-		s.errorResponse(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
 	if s.reportingService == nil {
 		s.errorResponse(w, "reporting not available", http.StatusServiceUnavailable)
 		return
@@ -578,7 +973,6 @@ func (s *Server) handleCampaignReports(w http.ResponseWriter, r *http.Request) {
 
 	stats, err := s.reportingService.GetCampaignStats(r.Context(), filter)
 	if err != nil {
-		s.logger.Error("failed to get campaign stats", zap.Error(err))
 		s.errorResponse(w, "failed to get stats", http.StatusInternalServerError)
 		return
 	}
@@ -586,28 +980,30 @@ func (s *Server) handleCampaignReports(w http.ResponseWriter, r *http.Request) {
 	s.jsonResponse(w, stats)
 }
 
-func (s *Server) handleLineItemReports(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet && r.Method != http.MethodPost {
-		s.errorResponse(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
+func (s *Server) handleSourceReports(w http.ResponseWriter, r *http.Request) {
 	if s.reportingService == nil {
 		s.errorResponse(w, "reporting not available", http.StatusServiceUnavailable)
 		return
 	}
 
-	var filter dsp.ReportFilter
-	if r.Method == http.MethodPost {
-		if err := json.NewDecoder(r.Body).Decode(&filter); err != nil {
-			s.errorResponse(w, "invalid json", http.StatusBadRequest)
-			return
-		}
+	stats, err := s.reportingService.GetSourceStats(r.Context())
+	if err != nil {
+		s.errorResponse(w, "failed to get stats", http.StatusInternalServerError)
+		return
 	}
 
-	stats, err := s.reportingService.GetLineItemStats(r.Context(), filter)
+	s.jsonResponse(w, stats)
+}
+
+func (s *Server) handleGeoReports(w http.ResponseWriter, r *http.Request) {
+	if s.reportingService == nil {
+		s.errorResponse(w, "reporting not available", http.StatusServiceUnavailable)
+		return
+	}
+
+	campaignID := r.URL.Query().Get("campaign_id")
+	stats, err := s.reportingService.GetGeoBreakdown(r.Context(), campaignID)
 	if err != nil {
-		s.logger.Error("failed to get line item stats", zap.Error(err))
 		s.errorResponse(w, "failed to get stats", http.StatusInternalServerError)
 		return
 	}
@@ -616,23 +1012,14 @@ func (s *Server) handleLineItemReports(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleTimeSeriesReport(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		s.errorResponse(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
 	if s.reportingService == nil {
 		s.errorResponse(w, "reporting not available", http.StatusServiceUnavailable)
 		return
 	}
 
 	campaignID := r.URL.Query().Get("campaign_id")
-	if campaignID == "" {
-		s.errorResponse(w, "campaign_id required", http.StatusBadRequest)
-		return
-	}
-
 	filter := dsp.ReportFilter{}
+
 	if startStr := r.URL.Query().Get("start_date"); startStr != "" {
 		if t, err := time.Parse("2006-01-02", startStr); err == nil {
 			filter.StartDate = t
@@ -646,7 +1033,6 @@ func (s *Server) handleTimeSeriesReport(w http.ResponseWriter, r *http.Request) 
 
 	points, err := s.reportingService.GetTimeSeries(r.Context(), campaignID, filter)
 	if err != nil {
-		s.logger.Error("failed to get time series", zap.Error(err))
 		s.errorResponse(w, "failed to get time series", http.StatusInternalServerError)
 		return
 	}
@@ -654,14 +1040,7 @@ func (s *Server) handleTimeSeriesReport(w http.ResponseWriter, r *http.Request) 
 	s.jsonResponse(w, points)
 }
 
-// ---- Stats (backward compatibility) ----
-
 func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		s.errorResponse(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
 	if s.reportingService == nil {
 		s.jsonResponse(w, []dsp.CampaignStats{})
 		return
@@ -687,15 +1066,8 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 	s.jsonResponse(w, stats)
 }
 
-// ---- Pacing ----
-
 func (s *Server) handlePacingStats(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		s.errorResponse(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	lineItemID := strings.TrimPrefix(r.URL.Path, "/pacing/")
+	lineItemID := strings.TrimPrefix(r.URL.Path, "/api/pacing/")
 	if lineItemID == "" {
 		s.errorResponse(w, "line_item_id required", http.StatusBadRequest)
 		return
@@ -710,92 +1082,42 @@ func (s *Server) handlePacingStats(w http.ResponseWriter, r *http.Request) {
 	s.jsonResponse(w, stats)
 }
 
-// ---- Events ----
-
-func (s *Server) handleClick(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		s.errorResponse(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	q := r.URL.Query()
-	campaignID := q.Get("campaign_id")
-	lineItemID := q.Get("line_item_id")
-	targetURL := q.Get("target_url")
-	userID := q.Get("user_id")
-
-	if campaignID == "" || lineItemID == "" || targetURL == "" {
-		s.errorResponse(w, "missing required params", http.StatusBadRequest)
-		return
-	}
-
-	clickID, redirectURL, err := s.eventService.RegisterClick(campaignID, lineItemID, userID, targetURL)
-	if err != nil {
-		s.errorResponse(w, "failed to register click", http.StatusInternalServerError)
-		return
-	}
-
-	s.logger.Info("click registered",
-		zap.String("click_id", clickID),
-		zap.String("campaign_id", campaignID),
-	)
-
-	if s.metrics != nil {
-		s.metrics.RecordClick(campaignID, lineItemID)
-	}
-
-	http.Redirect(w, r, redirectURL, http.StatusFound)
-}
-
-func (s *Server) handleConversion(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost && r.Method != http.MethodGet {
-		s.errorResponse(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	q := r.URL.Query()
-	clickID := q.Get("click_id")
-	externalID := q.Get("external_id")
-	eventName := q.Get("event_name")
-	if eventName == "" {
-		eventName = "install"
-	}
-	revenueStr := q.Get("revenue")
-	currency := q.Get("currency")
-	if currency == "" {
-		currency = "USD"
-	}
-
-	if clickID == "" && externalID == "" {
-		s.errorResponse(w, "click_id or external_id required", http.StatusBadRequest)
-		return
-	}
-
-	if err := s.eventService.RegisterConversion(clickID, externalID, eventName, revenueStr, currency); err != nil {
-		s.logger.Error("conversion error", zap.Error(err))
-	}
-
-	// Record conversion metric
-	if s.metrics != nil {
-		revenue := 0.0
-		fmt.Sscanf(revenueStr, "%f", &revenue)
-		// Would need to look up campaign from click
-		s.metrics.RecordConversion("", eventName, revenue)
-	}
-
-	w.Header().Set("Content-Type", "text/plain")
-	w.Write([]byte("OK"))
-}
-
-// ---- Helper Methods ----
+// =============================================
+// Helper Methods
+// =============================================
 
 func (s *Server) jsonResponse(w http.ResponseWriter, data interface{}) {
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(data)
+	json.NewEncoder(w).Encode(data)
 }
 
 func (s *Server) errorResponse(w http.ResponseWriter, message string, code int) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
-	_ = json.NewEncoder(w).Encode(map[string]string{"error": message})
+	json.NewEncoder(w).Encode(map[string]string{"error": message})
+}
+
+func getClientIP(r *http.Request) string {
+	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+		parts := strings.Split(xff, ",")
+		return strings.TrimSpace(parts[0])
+	}
+	if xri := r.Header.Get("X-Real-IP"); xri != "" {
+		return xri
+	}
+	ip := r.RemoteAddr
+	if idx := strings.LastIndex(ip, ":"); idx != -1 {
+		ip = ip[:idx]
+	}
+	return ip
+}
+
+// 1x1 transparent GIF
+var transparentPixel = []byte{
+	0x47, 0x49, 0x46, 0x38, 0x39, 0x61, 0x01, 0x00,
+	0x01, 0x00, 0x80, 0x00, 0x00, 0xFF, 0xFF, 0xFF,
+	0x00, 0x00, 0x00, 0x21, 0xF9, 0x04, 0x01, 0x00,
+	0x00, 0x00, 0x00, 0x2C, 0x00, 0x00, 0x00, 0x00,
+	0x01, 0x00, 0x01, 0x00, 0x00, 0x02, 0x02, 0x44,
+	0x01, 0x00, 0x3B,
 }

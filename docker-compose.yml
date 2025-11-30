@@ -1,114 +1,137 @@
-version: '3.8'
+version: "3.8"
 
 services:
+  # =============================================
   # Vector-DSP Application
-  dsp:
+  # =============================================
+  vector-dsp:
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: vector-dsp
     ports:
       - "8080:8080"
+      - "9090:9090"  # Prometheus metrics
     environment:
-      - VECTOR_DSP_HTTP_ADDR=:8080
       - VECTOR_DSP_ENV=development
+      - VECTOR_DSP_HTTP_ADDR=:8080
       - VECTOR_DSP_DB_HOST=postgres
       - VECTOR_DSP_DB_PORT=5432
       - VECTOR_DSP_DB_USER=vectordsp
       - VECTOR_DSP_DB_PASSWORD=vectordsp_secret
       - VECTOR_DSP_DB_NAME=vectordsp
-      - VECTOR_DSP_DB_SSLMODE=disable
       - VECTOR_DSP_REDIS_ADDR=redis:6379
-      - VECTOR_DSP_API_KEY_MASTER=dev-master-key-change-in-production
-      - VECTOR_DSP_AUTH_ENABLED=true
-      - VECTOR_DSP_RATE_LIMIT_ENABLED=true
-      - VECTOR_DSP_LOG_LEVEL=debug
-      - VECTOR_DSP_LOG_FORMAT=console
+      - VECTOR_DSP_AUTH_ENABLED=false
+      - VECTOR_DSP_TRACKING_BASE_URL=http://localhost:8080
+      - VECTOR_DSP_GEO_ENABLED=false
     depends_on:
       postgres:
         condition: service_healthy
       redis:
-        condition: service_healthy
-    restart: unless-stopped
+        condition: service_started
     volumes:
-      - ./static/uploads:/app/static/uploads
+      - ./data:/app/data
     networks:
-      - dsp-network
+      - vector-net
+    restart: unless-stopped
 
-  # PostgreSQL Database
+  # =============================================
+  # PostgreSQL (Campaign/Source Configuration)
+  # =============================================
   postgres:
-    image: postgres:16-alpine
-    container_name: vector-dsp-postgres
+    image: postgres:15-alpine
     environment:
-      - POSTGRES_USER=vectordsp
-      - POSTGRES_PASSWORD=vectordsp_secret
-      - POSTGRES_DB=vectordsp
+      POSTGRES_USER: vectordsp
+      POSTGRES_PASSWORD: vectordsp_secret
+      POSTGRES_DB: vectordsp
     ports:
       - "5432:5432"
     volumes:
-      - postgres-data:/var/lib/postgresql/data
-      - ./migrations/001_initial.sql:/docker-entrypoint-initdb.d/001_initial.sql:ro
+      - postgres_data:/var/lib/postgresql/data
+      - ./migrations/001_initial_schema.sql:/docker-entrypoint-initdb.d/001_initial_schema.sql
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U vectordsp -d vectordsp"]
-      interval: 5s
+      interval: 10s
       timeout: 5s
       retries: 5
-    restart: unless-stopped
     networks:
-      - dsp-network
+      - vector-net
 
-  # Redis Cache
+  # =============================================
+  # ClickHouse (Event Storage & Analytics)
+  # =============================================
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.1
+    ports:
+      - "8123:8123"  # HTTP
+      - "9000:9000"  # Native protocol
+    volumes:
+      - clickhouse_data:/var/lib/clickhouse
+      - ./migrations/clickhouse_001_schema.sql:/docker-entrypoint-initdb.d/001_schema.sql
+    environment:
+      CLICKHOUSE_DB: vectordsp
+      CLICKHOUSE_USER: default
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    networks:
+      - vector-net
+
+  # =============================================
+  # Redis (Caching, Pacing, Rate Limiting)
+  # =============================================
   redis:
     image: redis:7-alpine
-    container_name: vector-dsp-redis
     ports:
       - "6379:6379"
     volumes:
-      - redis-data:/data
+      - redis_data:/data
     command: redis-server --appendonly yes
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 5s
-      timeout: 5s
-      retries: 5
-    restart: unless-stopped
     networks:
-      - dsp-network
+      - vector-net
 
-  # Adminer (Database UI) - optional, for development
-  adminer:
-    image: adminer:4
-    container_name: vector-dsp-adminer
+  # =============================================
+  # Prometheus (Metrics Collection)
+  # =============================================
+  prometheus:
+    image: prom/prometheus:v2.47.0
     ports:
-      - "8081:8080"
-    depends_on:
-      - postgres
-    restart: unless-stopped
+      - "9091:9090"
+    volumes:
+      - ./deploy/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
     networks:
-      - dsp-network
-    profiles:
-      - dev
+      - vector-net
 
-  # Redis Commander (Redis UI) - optional, for development
-  redis-commander:
-    image: rediscommander/redis-commander:latest
-    container_name: vector-dsp-redis-commander
+  # =============================================
+  # Grafana (Metrics Visualization)
+  # =============================================
+  grafana:
+    image: grafana/grafana:10.1.0
+    ports:
+      - "3000:3000"
     environment:
-      - REDIS_HOSTS=local:redis:6379
-    ports:
-      - "8082:8081"
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./deploy/grafana/provisioning:/etc/grafana/provisioning
     depends_on:
-      - redis
-    restart: unless-stopped
+      - prometheus
     networks:
-      - dsp-network
-    profiles:
-      - dev
+      - vector-net
 
 volumes:
-  postgres-data:
-  redis-data:
+  postgres_data:
+  clickhouse_data:
+  redis_data:
+  prometheus_data:
+  grafana_data:
 
 networks:
-  dsp-network:
+  vector-net:
     driver: bridge

@@ -19,6 +19,7 @@ type Config struct {
 	Metrics   MetricsConfig
 	Geo       GeoConfig
 	Pacing    PacingGlobalConfig
+	Tracking  TrackingConfig
 }
 
 type ServerConfig struct {
@@ -71,29 +72,42 @@ type LogConfig struct {
 	Format string
 }
 
-// MetricsConfig configures Prometheus metrics.
 type MetricsConfig struct {
 	Enabled bool
 	Path    string
 	Port    string
 }
 
-// GeoConfig configures GeoIP lookup.
 type GeoConfig struct {
-	Enabled     bool
+	Enabled      bool
 	DatabasePath string
-	CacheSize   int
-	CacheTTL    time.Duration
+	CacheSize    int
+	CacheTTL     time.Duration
 }
 
-// PacingGlobalConfig holds global pacing settings.
 type PacingGlobalConfig struct {
-	// SmoothingEnabled enables spend smoothing across the day
 	SmoothingEnabled bool
-	// HourlyBudgetPct is the max percentage of daily budget per hour (for smoothing)
-	HourlyBudgetPct float64
-	// FreqCapLookback is how far back to check frequency caps
-	FreqCapLookback time.Duration
+	HourlyBudgetPct  float64
+	FreqCapLookback  time.Duration
+}
+
+// TrackingConfig holds tracking-related configuration
+type TrackingConfig struct {
+	// BaseURL is the public URL for tracking endpoints
+	// Example: https://track.vector-dsp.com
+	BaseURL string
+
+	// ClickTTL is how long to keep clicks in cache for attribution
+	ClickTTL time.Duration
+
+	// MMPCallTimeout is the timeout for calling MMP view URLs
+	MMPCallTimeout time.Duration
+
+	// EnableViewTracking enables view/impression tracking
+	EnableViewTracking bool
+
+	// EnableClickDedup enables click deduplication
+	EnableClickDedup bool
 }
 
 // Load reads configuration from environment variables with sensible defaults.
@@ -122,7 +136,16 @@ func Load() (*Config, error) {
 		Auth: AuthConfig{
 			Enabled:   getBoolEnv("VECTOR_DSP_AUTH_ENABLED", true),
 			MasterKey: getEnv("VECTOR_DSP_API_KEY_MASTER", ""),
-			SkipPaths: getSliceEnv("VECTOR_DSP_AUTH_SKIP_PATHS", []string{"/health", "/metrics", "/openrtb2/bid", "/openrtb2/win", "/openrtb2/loss"}),
+			SkipPaths: getSliceEnv("VECTOR_DSP_AUTH_SKIP_PATHS", []string{
+				"/health",
+				"/metrics",
+				"/openrtb2/bid",
+				"/openrtb2/win",
+				"/openrtb2/loss",
+				"/track/",
+				"/postback",
+				"/s2s/",
+			}),
 		},
 		RateLimit: RateLimitConfig{
 			Enabled:   getBoolEnv("VECTOR_DSP_RATE_LIMIT_ENABLED", true),
@@ -148,8 +171,15 @@ func Load() (*Config, error) {
 		},
 		Pacing: PacingGlobalConfig{
 			SmoothingEnabled: getBoolEnv("VECTOR_DSP_PACING_SMOOTHING", true),
-			HourlyBudgetPct:  getFloatEnv("VECTOR_DSP_PACING_HOURLY_PCT", 8.0), // ~1/12 of daily
+			HourlyBudgetPct:  getFloatEnv("VECTOR_DSP_PACING_HOURLY_PCT", 8.0),
 			FreqCapLookback:  getDurationEnv("VECTOR_DSP_PACING_FREQ_LOOKBACK", 24*time.Hour),
+		},
+		Tracking: TrackingConfig{
+			BaseURL:            getEnv("VECTOR_DSP_TRACKING_BASE_URL", "https://track.vector-dsp.com"),
+			ClickTTL:           getDurationEnv("VECTOR_DSP_TRACKING_CLICK_TTL", 30*24*time.Hour),
+			MMPCallTimeout:     getDurationEnv("VECTOR_DSP_TRACKING_MMP_TIMEOUT", 5*time.Second),
+			EnableViewTracking: getBoolEnv("VECTOR_DSP_TRACKING_VIEW_ENABLED", true),
+			EnableClickDedup:   getBoolEnv("VECTOR_DSP_TRACKING_CLICK_DEDUP", true),
 		},
 	}
 
@@ -178,7 +208,7 @@ func (c *Config) IsProduction() bool {
 	return c.Server.Env == "production"
 }
 
-// Helper functions for reading environment variables
+// Helper functions
 
 func getEnv(key, def string) string {
 	if v, ok := os.LookupEnv(key); ok && v != "" {

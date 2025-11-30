@@ -5,122 +5,166 @@ import (
 	"time"
 )
 
+// ===========================================
+// BID STRATEGY
+// ===========================================
+
 type BidStrategyType string
 
 const (
 	BidStrategyFixedCPM    BidStrategyType = "fixed_cpm"
 	BidStrategyDynamicCPM  BidStrategyType = "dynamic_cpm"
+	BidStrategyTargetCPI   BidStrategyType = "target_cpi"
 	BidStrategyTargetCPA   BidStrategyType = "target_cpa"
 	BidStrategyMaximizeROI BidStrategyType = "maximize_roi"
 )
 
-// Targeting defines restrictions for serving an ad with enhanced geo and domain support.
+type BidStrategy struct {
+	Type       BidStrategyType `json:"type"`
+	FixedCPM   float64         `json:"fixed_cpm,omitempty"`
+	MinCPM     float64         `json:"min_cpm,omitempty"`
+	MaxCPM     float64         `json:"max_cpm,omitempty"`
+	TargetCPI  float64         `json:"target_cpi,omitempty"`
+	TargetCPA  float64         `json:"target_cpa,omitempty"`
+	TargetROAS float64         `json:"target_roas,omitempty"`
+	BidShading float64         `json:"bid_shading,omitempty"`
+}
+
+// ===========================================
+// PACING
+// ===========================================
+
+type PacingType string
+
+const (
+	PacingTypeEven        PacingType = "even"
+	PacingTypeAccelerated PacingType = "accelerated"
+	PacingTypeFrontLoaded PacingType = "front_loaded"
+)
+
+type PacingConfig struct {
+	DailyBudget            float64    `json:"daily_budget"`
+	TotalBudget            float64    `json:"total_budget,omitempty"`
+	StartAt                time.Time  `json:"start_at"`
+	EndAt                  time.Time  `json:"end_at,omitempty"`
+	FreqCapPerUserPerDay   int32      `json:"freq_cap_per_user_per_day"`
+	FreqCapPerUserPerHour  int32      `json:"freq_cap_per_user_per_hour,omitempty"`
+	FreqCapPerUserLifetime int32      `json:"freq_cap_per_user_lifetime,omitempty"`
+	PacingType             PacingType `json:"pacing_type,omitempty"`
+	QPSLimitPerSource      int32      `json:"qps_limit_per_source,omitempty"`
+	HourlyBudgetCap        float64    `json:"hourly_budget_cap,omitempty"`
+}
+
+// ===========================================
+// TARGETING
+// ===========================================
+
 type Targeting struct {
 	// Geo targeting
-	Countries    []string `json:"countries,omitempty"`     // ISO 3166-1 alpha-2 codes
-	Regions      []string `json:"regions,omitempty"`       // Region/state names
-	Cities       []string `json:"cities,omitempty"`        // City names
-	PostalCodes  []string `json:"postal_codes,omitempty"`  // Postal/ZIP codes
-	DMAs         []int32  `json:"dmas,omitempty"`          // DMA codes (US)
-	GeoRadius    *GeoRadius `json:"geo_radius,omitempty"`  // Radius targeting
+	Countries   []string   `json:"countries,omitempty"`
+	Regions     []string   `json:"regions,omitempty"`
+	Cities      []string   `json:"cities,omitempty"`
+	PostalCodes []string   `json:"postal_codes,omitempty"`
+	DMAs        []int32    `json:"dmas,omitempty"`
+	GeoRadius   *GeoRadius `json:"geo_radius,omitempty"`
 
 	// Domain/App targeting
-	SiteDomains     []string `json:"site_domains,omitempty"`      // Domain whitelist
-	DomainBlacklist []string `json:"domain_blacklist,omitempty"`  // Domain blacklist
-	AppBundles      []string `json:"app_bundles,omitempty"`       // App bundle whitelist
-	BundleBlacklist []string `json:"bundle_blacklist,omitempty"`  // App bundle blacklist
+	SiteDomains     []string `json:"site_domains,omitempty"`
+	DomainBlacklist []string `json:"domain_blacklist,omitempty"`
+	AppBundles      []string `json:"app_bundles,omitempty"`
+	BundleBlacklist []string `json:"bundle_blacklist,omitempty"`
 
 	// Device targeting
-	DeviceTypes     []int32  `json:"device_types,omitempty"`     // 1=mobile, 2=PC, etc.
-	OS              []string `json:"os,omitempty"`               // ios, android, windows, etc.
-	OSVersionMin    string   `json:"os_version_min,omitempty"`   // Min OS version
-	OSVersionMax    string   `json:"os_version_max,omitempty"`   // Max OS version
-	DeviceMakes     []string `json:"device_makes,omitempty"`     // Apple, Samsung, etc.
-	DeviceModels    []string `json:"device_models,omitempty"`    // iPhone, Galaxy, etc.
-	
-	// Connectivity targeting
-	ConnectionTypes []int32  `json:"connection_types,omitempty"` // 1=ethernet, 2=wifi, 3=cell
-	Carriers        []string `json:"carriers,omitempty"`         // Carrier names
+	DeviceTypes  []int32  `json:"device_types,omitempty"`
+	OS           []string `json:"os,omitempty"`
+	OSVersionMin string   `json:"os_version_min,omitempty"`
+	OSVersionMax string   `json:"os_version_max,omitempty"`
+	DeviceMakes  []string `json:"device_makes,omitempty"`
+	DeviceModels []string `json:"device_models,omitempty"`
 
-	// Content targeting
-	CatWhitelist []string `json:"cat_whitelist,omitempty"` // IAB category whitelist
-	CatBlacklist []string `json:"cat_blacklist,omitempty"` // IAB category blacklist
-	Languages    []string `json:"languages,omitempty"`     // Content/device languages
+	// Connectivity
+	ConnectionTypes []int32  `json:"connection_types,omitempty"`
+	Carriers        []string `json:"carriers,omitempty"`
 
-	// Size targeting
+	// Content
+	CatWhitelist []string `json:"cat_whitelist,omitempty"`
+	CatBlacklist []string `json:"cat_blacklist,omitempty"`
+	Languages    []string `json:"languages,omitempty"`
+
+	// Size
 	MinBannerW int32 `json:"min_banner_w,omitempty"`
 	MinBannerH int32 `json:"min_banner_h,omitempty"`
 
-	// Time targeting
+	// Time
 	DayParting *DayParting `json:"day_parting,omitempty"`
 
-	// Audience targeting
-	AudienceIDs     []string `json:"audience_ids,omitempty"`     // First-party audience IDs
-	AudienceExclude []string `json:"audience_exclude,omitempty"` // Audiences to exclude
+	// Audience
+	AudienceIDs     []string `json:"audience_ids,omitempty"`
+	AudienceExclude []string `json:"audience_exclude,omitempty"`
 
-	// Publisher targeting
+	// Publisher
 	PublisherIDs     []string `json:"publisher_ids,omitempty"`
 	PublisherExclude []string `json:"publisher_exclude,omitempty"`
 }
 
-// GeoRadius defines radius-based geo targeting.
 type GeoRadius struct {
 	Latitude  float64 `json:"latitude"`
 	Longitude float64 `json:"longitude"`
 	RadiusKm  float64 `json:"radius_km"`
 }
 
-// DayParting defines time-of-day targeting.
 type DayParting struct {
-	Timezone string         `json:"timezone"` // e.g., "America/New_York"
-	Schedule []DaySchedule  `json:"schedule"`
+	Timezone string        `json:"timezone"`
+	Schedule []DaySchedule `json:"schedule"`
 }
 
-// DaySchedule defines hours for a specific day.
 type DaySchedule struct {
-	Day       int   `json:"day"`        // 0=Sunday, 1=Monday, etc.
-	StartHour int   `json:"start_hour"` // 0-23
-	EndHour   int   `json:"end_hour"`   // 0-23
+	Day       int `json:"day"`
+	StartHour int `json:"start_hour"`
+	EndHour   int `json:"end_hour"`
 }
 
-type BidStrategy struct {
-	Type        BidStrategyType `json:"type"`
-	FixedCPM    float64         `json:"fixed_cpm,omitempty"`
-	MinCPM      float64         `json:"min_cpm,omitempty"`      // Floor for dynamic bidding
-	MaxCPM      float64         `json:"max_cpm,omitempty"`      // Ceiling for dynamic bidding
-	TargetCPA   float64         `json:"target_cpa,omitempty"`   // Target cost per action
-	TargetROAS  float64         `json:"target_roas,omitempty"`  // Target return on ad spend
-	BidShading  float64         `json:"bid_shading,omitempty"`  // Bid reduction factor (0-1)
-}
+// ===========================================
+// MMP CONFIGURATION
+// ===========================================
 
-// PacingConfig defines spend and frequency caps for a line item.
-type PacingConfig struct {
-	DailyBudget          float64   `json:"daily_budget"`
-	TotalBudget          float64   `json:"total_budget,omitempty"`
-	StartAt              time.Time `json:"start_at"`
-	EndAt                time.Time `json:"end_at,omitempty"`
-	
-	// Frequency caps
-	FreqCapPerUserPerDay   int32 `json:"freq_cap_per_user_per_day"`
-	FreqCapPerUserPerHour  int32 `json:"freq_cap_per_user_per_hour,omitempty"`
-	FreqCapPerUserLifetime int32 `json:"freq_cap_per_user_lifetime,omitempty"`
-	
-	// Advanced pacing
-	PacingType          PacingType `json:"pacing_type,omitempty"`           // even, accelerated, front-loaded
-	QPSLimitPerSource   int32      `json:"qps_limit_per_source,omitempty"`
-	HourlyBudgetCap     float64    `json:"hourly_budget_cap,omitempty"`     // Max spend per hour
-	SpendVelocity       float64    `json:"spend_velocity,omitempty"`        // Target spend rate
-}
-
-type PacingType string
+type MMPType string
 
 const (
-	PacingTypeEven        PacingType = "even"         // Spread evenly
-	PacingTypeAccelerated PacingType = "accelerated"  // Spend as fast as possible
-	PacingTypeFrontLoaded PacingType = "front_loaded" // Spend more early
+	MMPTypeNone     MMPType = "none"
+	MMPTypeAppsFlyer MMPType = "appsflyer"
+	MMPTypeAdjust   MMPType = "adjust"
+	MMPTypeSingular MMPType = "singular"
+	MMPTypeBranch   MMPType = "branch"
+	MMPTypeKochava  MMPType = "kochava"
 )
 
-// Creative represents a creative variant with enhanced fields.
+// MMPConfig holds MMP tracking URLs and configuration.
+// These URLs are provided by the client when they add Vector-DSP as a source.
+type MMPConfig struct {
+	// MMP type
+	Type MMPType `json:"type"`
+
+	// Click URL from MMP (client provides this)
+	// Example: https://app.appsflyer.com/com.app?pid=vector_dsp&c={campaign}&clickid={click_id}&...
+	ClickURL string `json:"click_url"`
+
+	// View/Impression URL from MMP (for view-through attribution)
+	// Example: https://impression.appsflyer.com/com.app?pid=vector_dsp&...
+	ViewURL string `json:"view_url"`
+
+	// Custom macros mapping for this MMP
+	// {"click_id": "clickid", "campaign": "c", "gaid": "advertising_id"}
+	MacrosMapping map[string]string `json:"macros_mapping,omitempty"`
+
+	// Postback configuration
+	PostbackEvents []string `json:"postback_events,omitempty"` // ["install", "registration", "purchase"]
+}
+
+// ===========================================
+// CREATIVE
+// ===========================================
+
 type Creative struct {
 	ID           string   `json:"id"`
 	AdvertiserID string   `json:"advertiser_id,omitempty"`
@@ -130,9 +174,9 @@ type Creative struct {
 	H            int32    `json:"h"`
 	ADomain      []string `json:"adomain"`
 	ClickURL     string   `json:"click_url"`
-	
+
 	// Creative type
-	Format   string `json:"format,omitempty"`   // banner, video, native, audio
+	Format   string `json:"format,omitempty"` // banner, video, native, audio
 	VideoURL string `json:"video_url,omitempty"`
 	VASTTag  string `json:"vast_tag,omitempty"`
 
@@ -140,8 +184,8 @@ type Creative struct {
 	NativeAssets *NativeAssets `json:"native_assets,omitempty"`
 
 	// Audit status
-	AuditStatus string `json:"audit_status,omitempty"` // pending, approved, rejected
-	
+	AuditStatus string `json:"audit_status,omitempty"`
+
 	// Tracking
 	ImpressionTrackers []string `json:"impression_trackers,omitempty"`
 	ClickTrackers      []string `json:"click_trackers,omitempty"`
@@ -150,42 +194,22 @@ type Creative struct {
 	UpdatedAt time.Time `json:"updated_at,omitempty"`
 }
 
-// NativeAssets holds native ad creative assets.
 type NativeAssets struct {
-	Title       string `json:"title,omitempty"`
-	Description string `json:"description,omitempty"`
-	IconURL     string `json:"icon_url,omitempty"`
-	ImageURL    string `json:"image_url,omitempty"`
-	CTAText     string `json:"cta_text,omitempty"`
+	Title       string  `json:"title,omitempty"`
+	Description string  `json:"description,omitempty"`
+	IconURL     string  `json:"icon_url,omitempty"`
+	ImageURL    string  `json:"image_url,omitempty"`
+	CTAText     string  `json:"cta_text,omitempty"`
 	Rating      float64 `json:"rating,omitempty"`
-	Likes       int32  `json:"likes,omitempty"`
-	Downloads   int32  `json:"downloads,omitempty"`
-	Price       string `json:"price,omitempty"`
-	SalePrice   string `json:"sale_price,omitempty"`
+	Likes       int32   `json:"likes,omitempty"`
+	Downloads   int32   `json:"downloads,omitempty"`
+	Price       string  `json:"price,omitempty"`
+	SalePrice   string  `json:"sale_price,omitempty"`
 }
 
-// LineItem groups creatives under a single targeting and bidding strategy.
-type LineItem struct {
-	ID          string      `json:"id"`
-	Name        string      `json:"name"`
-	CampaignID  string      `json:"campaign_id"`
-	Targeting   Targeting   `json:"targeting"`
-	BidStrategy BidStrategy `json:"bid_strategy"`
-	Pacing      PacingConfig `json:"pacing"`
-	Creatives   []Creative  `json:"creatives"`
-	IsActive    bool        `json:"is_active"`
-	Priority    int32       `json:"priority"`
-	
-	// Delivery optimization
-	OptimizationGoal OptimizationGoal `json:"optimization_goal,omitempty"`
-	
-	// Attribution
-	AttributionWindow int32  `json:"attribution_window,omitempty"` // Days
-	AttributionModel  string `json:"attribution_model,omitempty"`  // last_click, linear, time_decay
-	
-	CreatedAt time.Time `json:"created_at,omitempty"`
-	UpdatedAt time.Time `json:"updated_at,omitempty"`
-}
+// ===========================================
+// LINE ITEM
+// ===========================================
 
 type OptimizationGoal string
 
@@ -193,8 +217,54 @@ const (
 	OptimizeClicks      OptimizationGoal = "clicks"
 	OptimizeConversions OptimizationGoal = "conversions"
 	OptimizeImpressions OptimizationGoal = "impressions"
+	OptimizeInstalls    OptimizationGoal = "installs"
 	OptimizeVideoViews  OptimizationGoal = "video_views"
 )
+
+type LineItem struct {
+	ID         string      `json:"id"`
+	Name       string      `json:"name"`
+	CampaignID string      `json:"campaign_id"`
+	Targeting  Targeting   `json:"targeting"`
+	BidStrategy BidStrategy `json:"bid_strategy"`
+	Pacing     PacingConfig `json:"pacing"`
+	Creatives  []Creative  `json:"creatives"`
+	IsActive   bool        `json:"is_active"`
+	Priority   int32       `json:"priority"`
+
+	// Delivery optimization
+	OptimizationGoal OptimizationGoal `json:"optimization_goal,omitempty"`
+
+	// Attribution
+	AttributionWindow int32  `json:"attribution_window,omitempty"`
+	AttributionModel  string `json:"attribution_model,omitempty"`
+
+	CreatedAt time.Time `json:"created_at,omitempty"`
+	UpdatedAt time.Time `json:"updated_at,omitempty"`
+}
+
+func (li *LineItem) Validate() error {
+	if li.ID == "" {
+		return errors.New("line_item id is required")
+	}
+	if li.CampaignID == "" {
+		return errors.New("line_item campaign_id is required")
+	}
+	if li.BidStrategy.Type == BidStrategyFixedCPM && li.BidStrategy.FixedCPM <= 0 {
+		return errors.New("fixed_cpm must be > 0")
+	}
+	if li.Pacing.DailyBudget <= 0 {
+		return errors.New("daily_budget must be > 0")
+	}
+	if len(li.Creatives) == 0 {
+		return errors.New("at least one creative required")
+	}
+	return nil
+}
+
+// ===========================================
+// CAMPAIGN
+// ===========================================
 
 type CampaignStatus string
 
@@ -209,12 +279,12 @@ const (
 type CampaignObjective string
 
 const (
-	ObjectiveBrandAwareness   CampaignObjective = "brand_awareness"
-	ObjectiveTraffic          CampaignObjective = "traffic"
-	ObjectiveConversions      CampaignObjective = "conversions"
-	ObjectiveAppInstalls      CampaignObjective = "app_installs"
-	ObjectiveVideoViews       CampaignObjective = "video_views"
-	ObjectiveLeadGeneration   CampaignObjective = "lead_generation"
+	ObjectiveBrandAwareness CampaignObjective = "brand_awareness"
+	ObjectiveTraffic        CampaignObjective = "traffic"
+	ObjectiveConversions    CampaignObjective = "conversions"
+	ObjectiveAppInstalls    CampaignObjective = "app_installs"
+	ObjectiveVideoViews     CampaignObjective = "video_views"
+	ObjectiveLeadGeneration CampaignObjective = "lead_generation"
 )
 
 type Campaign struct {
@@ -223,20 +293,34 @@ type Campaign struct {
 	AdvertiserID string            `json:"advertiser_id"`
 	Status       CampaignStatus    `json:"status"`
 	Objective    CampaignObjective `json:"objective,omitempty"`
-	
+
+	// App info (for mobile campaigns)
+	AppBundle   string `json:"app_bundle,omitempty"`   // com.client.app
+	AppName     string `json:"app_name,omitempty"`
+	AppStoreURL string `json:"app_store_url,omitempty"`
+
 	// Budget
-	TotalBudget  float64   `json:"total_budget,omitempty"`
-	DailyBudget  float64   `json:"daily_budget,omitempty"`
-	StartDate    time.Time `json:"start_date,omitempty"`
-	EndDate      time.Time `json:"end_date,omitempty"`
-	
-	LineItems    []LineItem `json:"line_items"`
-	
+	TotalBudget float64   `json:"total_budget,omitempty"`
+	DailyBudget float64   `json:"daily_budget,omitempty"`
+	StartDate   time.Time `json:"start_date,omitempty"`
+	EndDate     time.Time `json:"end_date,omitempty"`
+
+	// MMP Configuration (provided by client)
+	MMP MMPConfig `json:"mmp"`
+
+	// Line Items
+	LineItems []LineItem `json:"line_items"`
+
+	// Payout to sources
+	PayoutType   string  `json:"payout_type,omitempty"`   // fixed, percent, dynamic
+	PayoutAmount float64 `json:"payout_amount,omitempty"` // Amount or percentage
+	PayoutEvent  string  `json:"payout_event,omitempty"`  // install, registration, purchase
+
 	// Reporting
 	ConversionPixels []string `json:"conversion_pixels,omitempty"`
-	
-	CreatedAt    time.Time `json:"created_at"`
-	UpdatedAt    time.Time `json:"updated_at"`
+
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
 }
 
 func (c *Campaign) Validate() error {
@@ -257,21 +341,7 @@ func (c *Campaign) Validate() error {
 	return nil
 }
 
-func (li *LineItem) Validate() error {
-	if li.ID == "" {
-		return errors.New("line_item id is required")
-	}
-	if li.CampaignID == "" {
-		return errors.New("line_item campaign_id is required")
-	}
-	if li.BidStrategy.Type == BidStrategyFixedCPM && li.BidStrategy.FixedCPM <= 0 {
-		return errors.New("fixed_cpm must be > 0")
-	}
-	if li.Pacing.DailyBudget <= 0 {
-		return errors.New("daily_budget must be > 0")
-	}
-	if len(li.Creatives) == 0 {
-		return errors.New("at least one creative required")
-	}
-	return nil
+// HasMMPTracking returns true if MMP tracking is configured
+func (c *Campaign) HasMMPTracking() bool {
+	return c.MMP.Type != MMPTypeNone && c.MMP.Type != "" && c.MMP.ClickURL != ""
 }
