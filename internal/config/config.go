@@ -10,12 +10,15 @@ import (
 
 // Config holds all configuration for the Vector-DSP application.
 type Config struct {
-	Server   ServerConfig
-	Database DatabaseConfig
-	Redis    RedisConfig
-	Auth     AuthConfig
+	Server    ServerConfig
+	Database  DatabaseConfig
+	Redis     RedisConfig
+	Auth      AuthConfig
 	RateLimit RateLimitConfig
-	Log      LogConfig
+	Log       LogConfig
+	Metrics   MetricsConfig
+	Geo       GeoConfig
+	Pacing    PacingGlobalConfig
 }
 
 type ServerConfig struct {
@@ -68,6 +71,31 @@ type LogConfig struct {
 	Format string
 }
 
+// MetricsConfig configures Prometheus metrics.
+type MetricsConfig struct {
+	Enabled bool
+	Path    string
+	Port    string
+}
+
+// GeoConfig configures GeoIP lookup.
+type GeoConfig struct {
+	Enabled     bool
+	DatabasePath string
+	CacheSize   int
+	CacheTTL    time.Duration
+}
+
+// PacingGlobalConfig holds global pacing settings.
+type PacingGlobalConfig struct {
+	// SmoothingEnabled enables spend smoothing across the day
+	SmoothingEnabled bool
+	// HourlyBudgetPct is the max percentage of daily budget per hour (for smoothing)
+	HourlyBudgetPct float64
+	// FreqCapLookback is how far back to check frequency caps
+	FreqCapLookback time.Duration
+}
+
 // Load reads configuration from environment variables with sensible defaults.
 func Load() (*Config, error) {
 	cfg := &Config{
@@ -94,7 +122,7 @@ func Load() (*Config, error) {
 		Auth: AuthConfig{
 			Enabled:   getBoolEnv("VECTOR_DSP_AUTH_ENABLED", true),
 			MasterKey: getEnv("VECTOR_DSP_API_KEY_MASTER", ""),
-			SkipPaths: getSliceEnv("VECTOR_DSP_AUTH_SKIP_PATHS", []string{"/health", "/openrtb2/bid", "/openrtb2/win", "/openrtb2/loss"}),
+			SkipPaths: getSliceEnv("VECTOR_DSP_AUTH_SKIP_PATHS", []string{"/health", "/metrics", "/openrtb2/bid", "/openrtb2/win", "/openrtb2/loss"}),
 		},
 		RateLimit: RateLimitConfig{
 			Enabled:   getBoolEnv("VECTOR_DSP_RATE_LIMIT_ENABLED", true),
@@ -106,6 +134,22 @@ func Load() (*Config, error) {
 		Log: LogConfig{
 			Level:  getEnv("VECTOR_DSP_LOG_LEVEL", "info"),
 			Format: getEnv("VECTOR_DSP_LOG_FORMAT", "json"),
+		},
+		Metrics: MetricsConfig{
+			Enabled: getBoolEnv("VECTOR_DSP_METRICS_ENABLED", true),
+			Path:    getEnv("VECTOR_DSP_METRICS_PATH", "/metrics"),
+			Port:    getEnv("VECTOR_DSP_METRICS_PORT", "9090"),
+		},
+		Geo: GeoConfig{
+			Enabled:      getBoolEnv("VECTOR_DSP_GEO_ENABLED", false),
+			DatabasePath: getEnv("VECTOR_DSP_GEO_DB_PATH", "/app/data/GeoLite2-City.mmdb"),
+			CacheSize:    getIntEnv("VECTOR_DSP_GEO_CACHE_SIZE", 10000),
+			CacheTTL:     getDurationEnv("VECTOR_DSP_GEO_CACHE_TTL", 1*time.Hour),
+		},
+		Pacing: PacingGlobalConfig{
+			SmoothingEnabled: getBoolEnv("VECTOR_DSP_PACING_SMOOTHING", true),
+			HourlyBudgetPct:  getFloatEnv("VECTOR_DSP_PACING_HOURLY_PCT", 8.0), // ~1/12 of daily
+			FreqCapLookback:  getDurationEnv("VECTOR_DSP_PACING_FREQ_LOOKBACK", 24*time.Hour),
 		},
 	}
 

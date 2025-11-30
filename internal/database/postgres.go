@@ -23,7 +23,6 @@ func NewPostgresDB(ctx context.Context, cfg config.DatabaseConfig, logger *zap.L
 		return nil, fmt.Errorf("failed to parse database config: %w", err)
 	}
 
-	// Configure pool
 	poolConfig.MaxConns = int32(cfg.MaxConns)
 	poolConfig.MinConns = int32(cfg.MinConns)
 	poolConfig.MaxConnLifetime = time.Hour
@@ -35,7 +34,6 @@ func NewPostgresDB(ctx context.Context, cfg config.DatabaseConfig, logger *zap.L
 		return nil, fmt.Errorf("failed to create connection pool: %w", err)
 	}
 
-	// Verify connection
 	if err := pool.Ping(ctx); err != nil {
 		pool.Close()
 		return nil, fmt.Errorf("failed to ping database: %w", err)
@@ -70,15 +68,4 @@ func (db *PostgresDB) Health(ctx context.Context) error {
 // Stats returns connection pool statistics.
 func (db *PostgresDB) Stats() *pgxpool.Stat {
 	return db.Pool.Stat()
-}
-
-// RunMigrations executes SQL migrations from the provided directory.
-// For production, consider using a proper migration tool like golang-migrate.
-func (db *PostgresDB) RunMigrations(ctx context.Context, migrationSQL string) error {
-	_, err := db.Pool.Exec(ctx, migrationSQL)
-	if err != nil {
-		return fmt.Errorf("failed to run migrations: %w", err)
-	}
-	db.logger.Info("database migrations completed")
-	return nil
 }

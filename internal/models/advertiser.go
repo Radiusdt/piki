@@ -1,36 +1,69 @@
 package models
 
 import (
-    "errors"
-    "time"
+	"errors"
+	"time"
 )
 
-// Advertiser represents an advertiser entity in the DSP platform.  An advertiser
-// can own multiple campaigns and contains identifying information.  Fields
-// mirror many of the requirements outlined in the Ibiza DSP frontend README:
-// name/legal name, tax identifiers and contact details.  CreatedAt and
-// UpdatedAt are maintained by the service layer.
+// Advertiser represents an advertiser entity in the DSP platform.
 type Advertiser struct {
-    ID        string    `json:"id"`
-    Name      string    `json:"name"`
-    LegalName string    `json:"legal_name"`
-    TaxID     string    `json:"tax_id,omitempty"`
-    Address   string    `json:"address,omitempty"`
-    CreatedAt time.Time `json:"created_at"`
-    UpdatedAt time.Time `json:"updated_at"`
+	ID        string    `json:"id"`
+	Name      string    `json:"name"`
+	LegalName string    `json:"legal_name,omitempty"`
+	TaxID     string    `json:"tax_id,omitempty"`
+	Address   string    `json:"address,omitempty"`
+	Website   string    `json:"website,omitempty"`
+	Industry  string    `json:"industry,omitempty"`
+	Status    string    `json:"status,omitempty"` // active, paused, suspended
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
 }
 
-// Validate checks that required fields are present.  Only the ID and Name
-// fields are mandatory; other fields are optional.
+// Validate checks that required fields are present.
 func (a *Advertiser) Validate() error {
-    if a == nil {
-        return errors.New("advertiser is nil")
-    }
-    if a.ID == "" {
-        return errors.New("id is required")
-    }
-    if a.Name == "" {
-        return errors.New("name is required")
-    }
-    return nil
+	if a == nil {
+		return errors.New("advertiser is nil")
+	}
+	if a.ID == "" {
+		return errors.New("id is required")
+	}
+	if a.Name == "" {
+		return errors.New("name is required")
+	}
+	return nil
+}
+
+// AdGroup represents a grouping of creatives within a campaign.
+type AdGroup struct {
+	ID          string    `json:"id"`
+	CampaignID  string    `json:"campaign_id"`
+	Name        string    `json:"name"`
+	Budget      float64   `json:"budget"`
+	StartAt     time.Time `json:"start_at"`
+	EndAt       time.Time `json:"end_at"`
+	Targeting   Targeting `json:"targeting"`
+	CreativeIDs []string  `json:"creative_ids"`
+	IsActive    bool      `json:"is_active"`
+	CreatedAt   time.Time `json:"created_at"`
+	UpdatedAt   time.Time `json:"updated_at"`
+}
+
+// Validate ensures the AdGroup has the minimal required data.
+func (ag *AdGroup) Validate() error {
+	if ag == nil {
+		return errors.New("adgroup is nil")
+	}
+	if ag.ID == "" {
+		return errors.New("id is required")
+	}
+	if ag.CampaignID == "" {
+		return errors.New("campaign_id is required")
+	}
+	if ag.Name == "" {
+		return errors.New("name is required")
+	}
+	if ag.Budget <= 0 {
+		return errors.New("budget must be > 0")
+	}
+	return nil
 }

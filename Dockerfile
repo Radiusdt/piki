@@ -38,13 +38,13 @@ COPY --from=builder /app/vector-dsp /app/vector-dsp
 # Copy migrations
 COPY --from=builder /app/migrations /app/migrations
 
-# Create directories for uploads
-RUN mkdir -p /app/static/uploads && chown -R appuser:appuser /app
+# Create directories
+RUN mkdir -p /app/static/uploads /app/data && chown -R appuser:appuser /app
 
 # Switch to non-root user
 USER appuser
 
-# Expose port
+# Expose ports
 EXPOSE 8080
 
 # Health check

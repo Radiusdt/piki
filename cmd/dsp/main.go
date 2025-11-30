@@ -11,6 +11,7 @@ import (
 	"github.com/radiusdt/vector-dsp/internal/config"
 	"github.com/radiusdt/vector-dsp/internal/database"
 	"github.com/radiusdt/vector-dsp/internal/httpserver"
+	"github.com/radiusdt/vector-dsp/internal/metrics"
 	"github.com/radiusdt/vector-dsp/internal/middleware"
 	"go.uber.org/zap"
 )
@@ -19,7 +20,6 @@ func main() {
 	// Load configuration
 	cfg, err := config.Load()
 	if err != nil {
-		// Can't use logger yet, fall back to standard log
 		panic("failed to load config: " + err.Error())
 	}
 
@@ -39,6 +39,13 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	// Initialize Prometheus metrics
+	var m *metrics.Metrics
+	if cfg.Metrics.Enabled {
+		m = metrics.NewMetrics("vector_dsp")
+		logger.Info("Prometheus metrics enabled", zap.String("path", cfg.Metrics.Path))
+	}
+
 	// Initialize PostgreSQL
 	db, err := database.NewPostgresDB(ctx, cfg.Database, logger)
 	if err != nil {
@@ -55,20 +62,21 @@ func main() {
 
 	// Build dependencies
 	deps := &httpserver.Dependencies{
-		DB:     db,
-		Redis:  redis,
-		Config: cfg,
-		Logger: logger,
+		DB:      db,
+		Redis:   redis,
+		Config:  cfg,
+		Logger:  logger,
+		Metrics: m,
 	}
 
 	// Create HTTP server with all middlewares
 	handler := httpserver.NewServer(deps)
 
-	// Apply middleware chain (order matters: outermost first)
-	// Recovery -> Logging -> RateLimit -> Auth -> Handler
+	// Apply middleware chain
 	recoveryMW := middleware.NewRecoveryMiddleware(logger)
 	loggingMW := middleware.NewLoggingMiddleware(logger)
 	rateLimitMW := middleware.NewRateLimitMiddleware(cfg.RateLimit, logger)
+	rateLimitMW.SetMetrics(m)
 	authMW := middleware.NewAuthMiddleware(cfg.Auth, logger)
 
 	finalHandler := recoveryMW.Handler(
@@ -97,7 +105,7 @@ func main() {
 		}
 	}()
 
-	// Start rate limiter cleanup goroutine
+	// Start background goroutines
 	go func() {
 		ticker := time.NewTicker(1 * time.Hour)
 		defer ticker.Stop()
@@ -110,6 +118,27 @@ func main() {
 			}
 		}
 	}()
+
+	// Update metrics periodically
+	if m != nil {
+		go func() {
+			ticker := time.NewTicker(30 * time.Second)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ticker.C:
+					stat := db.Stats()
+					m.UpdateDBStats(
+						int(stat.IdleConns()),
+						int(stat.AcquiredConns()),
+						int(stat.TotalConns()),
+					)
+				case <-ctx.Done():
+					return
+				}
+			}
+		}()
+	}
 
 	// Wait for interrupt signal
 	quit := make(chan os.Signal, 1)
@@ -127,7 +156,7 @@ func main() {
 		logger.Error("server forced to shutdown", zap.Error(err))
 	}
 
-	// Cancel main context to stop background goroutines
+	// Cancel main context
 	cancel()
 
 	logger.Info("server stopped")

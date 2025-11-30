@@ -24,7 +24,6 @@ func NewRedisDB(ctx context.Context, cfg config.RedisConfig, logger *zap.Logger)
 		PoolSize: 100,
 	})
 
-	// Verify connection
 	if err := client.Ping(ctx).Err(); err != nil {
 		return nil, fmt.Errorf("failed to connect to Redis: %w", err)
 	}

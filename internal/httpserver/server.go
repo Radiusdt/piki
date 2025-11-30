@@ -1,6 +1,7 @@
 package httpserver
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -8,21 +9,25 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/radiusdt/vector-dsp/internal/config"
 	"github.com/radiusdt/vector-dsp/internal/database"
 	"github.com/radiusdt/vector-dsp/internal/dsp"
+	"github.com/radiusdt/vector-dsp/internal/metrics"
 	"github.com/radiusdt/vector-dsp/internal/models"
 	"github.com/radiusdt/vector-dsp/internal/storage"
+	"github.com/radiusdt/vector-dsp/internal/targeting"
 	"go.uber.org/zap"
 )
 
 // Dependencies holds all external dependencies for the server.
 type Dependencies struct {
-	DB     *database.PostgresDB
-	Redis  *database.RedisDB
-	Config *config.Config
-	Logger *zap.Logger
+	DB      *database.PostgresDB
+	Redis   *database.RedisDB
+	Config  *config.Config
+	Logger  *zap.Logger
+	Metrics *metrics.Metrics
 }
 
 // Server wraps HTTP handlers and DSP services.
@@ -33,33 +38,74 @@ type Server struct {
 	advertiserService *dsp.AdvertiserService
 	adGroupService    *dsp.AdGroupService
 	creativeService   *dsp.CreativeService
-	statsService      *dsp.StatsService
+	reportingService  *dsp.ReportingService
+	pacingEngine      dsp.PacingEngine
 	logger            *zap.Logger
 	config            *config.Config
+	metrics           *metrics.Metrics
 }
 
 // NewServer constructs a new http.Handler with all routes registered.
 func NewServer(deps *Dependencies) http.Handler {
-	// Initialize repositories (PostgreSQL-backed)
-	cRepo := storage.NewPostgresCampaignRepo(deps.DB.Pool)
-	advRepo := storage.NewPostgresAdvertiserRepo(deps.DB.Pool)
-	eventStore := storage.NewPostgresEventStore(deps.DB.Pool)
-	
-	// For now, use in-memory for ad groups and creatives (can be migrated later)
+	// Initialize repositories
+	var cRepo storage.CampaignRepo
+	var advRepo storage.AdvertiserRepo
+	var eventStore storage.EventStore
+
+	if deps.DB != nil {
+		cRepo = storage.NewPostgresCampaignRepo(deps.DB.Pool)
+		advRepo = storage.NewPostgresAdvertiserRepo(deps.DB.Pool)
+		eventStore = storage.NewPostgresEventStore(deps.DB.Pool)
+	} else {
+		cRepo = storage.NewInMemoryCampaignRepo()
+		advRepo = storage.NewInMemoryAdvertiserRepo()
+		eventStore = storage.NewInMemoryEventStore()
+	}
+
 	agRepo := storage.NewInMemoryAdGroupRepo()
 	crRepo := storage.NewInMemoryCreativeRepo()
 
-	// Initialize pacing engine (Redis-backed)
-	pacer := storage.NewRedisPacingEngine(deps.Redis.Client)
+	// Initialize pacing engine
+	var pacer dsp.PacingEngine
+	if deps.Redis != nil {
+		pacer = dsp.NewRedisPacingEngine(deps.Redis.Client, deps.Config.Pacing, deps.Metrics)
+	} else {
+		pacer = dsp.NewInMemoryPacingEngine()
+	}
+
+	// Initialize targeting engine
+	var targetingEngine *targeting.TargetingEngine
+	if deps.Config.Geo.Enabled {
+		geoProvider, err := targeting.NewMaxMindGeoProvider(deps.Config.Geo.DatabasePath)
+		if err != nil {
+			deps.Logger.Warn("failed to initialize geo provider, using mock", zap.Error(err))
+			geoProvider = nil
+		}
+		if geoProvider != nil {
+			targetingEngine = targeting.NewTargetingEngine(
+				geoProvider,
+				deps.Config.Geo.CacheSize,
+				deps.Config.Geo.CacheTTL,
+				deps.Metrics,
+			)
+		}
+	}
+	if targetingEngine == nil {
+		targetingEngine = targeting.NewTargetingEngine(nil, 1000, time.Hour, deps.Metrics)
+	}
 
 	// Initialize services
 	cSvc := dsp.NewCampaignService(cRepo)
-	bSvc := dsp.NewBidService(cRepo, pacer)
+	bSvc := dsp.NewBidService(cRepo, pacer, targetingEngine, deps.Metrics)
 	eSvc := dsp.NewEventService(eventStore)
 	advSvc := dsp.NewAdvertiserService(advRepo)
 	agSvc := dsp.NewAdGroupService(agRepo)
 	crSvc := dsp.NewCreativeService(crRepo)
-	statsSvc := dsp.NewStatsService(eventStore)
+
+	var reportingSvc *dsp.ReportingService
+	if deps.Redis != nil {
+		reportingSvc = dsp.NewReportingService(eventStore, deps.Redis.Client)
+	}
 
 	s := &Server{
 		campaignService:   cSvc,
@@ -68,22 +114,29 @@ func NewServer(deps *Dependencies) http.Handler {
 		advertiserService: advSvc,
 		adGroupService:    agSvc,
 		creativeService:   crSvc,
-		statsService:      statsSvc,
+		reportingService:  reportingSvc,
+		pacingEngine:      pacer,
 		logger:            deps.Logger,
 		config:            deps.Config,
+		metrics:           deps.Metrics,
 	}
 
 	mux := http.NewServeMux()
 
-	// Health check (no auth required)
+	// Health check
 	mux.HandleFunc("/health", s.handleHealth)
 
-	// OpenRTB endpoints (no auth for SSP integration)
+	// Prometheus metrics
+	if deps.Config.Metrics.Enabled {
+		mux.Handle(deps.Config.Metrics.Path, metrics.Handler())
+	}
+
+	// OpenRTB endpoints
 	mux.HandleFunc("/openrtb2/bid", s.handleBid)
 	mux.HandleFunc("/openrtb2/win", s.handleWinNotice)
 	mux.HandleFunc("/openrtb2/loss", s.handleLossNotice)
 
-	// Campaign management (requires auth)
+	// Campaign management
 	mux.HandleFunc("/campaigns", s.handleCampaigns)
 	mux.HandleFunc("/campaigns/", s.handleCampaignByID)
 
@@ -100,8 +153,16 @@ func NewServer(deps *Dependencies) http.Handler {
 	mux.HandleFunc("/creatives/", s.handleCreativeByID)
 	mux.HandleFunc("/creatives/upload", s.handleCreativeUpload)
 
-	// Stats
+	// Reporting
+	mux.HandleFunc("/reports/campaigns", s.handleCampaignReports)
+	mux.HandleFunc("/reports/line-items", s.handleLineItemReports)
+	mux.HandleFunc("/reports/time-series", s.handleTimeSeriesReport)
+
+	// Stats (backward compatibility)
 	mux.HandleFunc("/stats", s.handleStats)
+
+	// Pacing
+	mux.HandleFunc("/pacing/", s.handlePacingStats)
 
 	// Events
 	mux.HandleFunc("/events/click", s.handleClick)
@@ -150,6 +211,63 @@ func (s *Server) handleBid(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(resp)
+}
+
+// ---- Win/Loss Notifications ----
+
+func (s *Server) handleWinNotice(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodPost {
+		s.errorResponse(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	q := r.URL.Query()
+	campaignID := q.Get("campaign_id")
+	lineItemID := q.Get("line_item_id")
+	priceStr := q.Get("price")
+
+	s.logger.Info("win notice",
+		zap.String("imp_id", q.Get("imp_id")),
+		zap.String("price", priceStr),
+		zap.String("bid_id", q.Get("bid_id")),
+		zap.String("campaign_id", campaignID),
+		zap.String("line_item_id", lineItemID),
+	)
+
+	// Record win in metrics
+	if s.metrics != nil && campaignID != "" {
+		price := 0.0
+		fmt.Sscanf(priceStr, "%f", &price)
+		s.metrics.RecordWin(campaignID, lineItemID, price)
+	}
+
+	w.Header().Set("Content-Type", "text/plain")
+	w.Write([]byte("OK"))
+}
+
+func (s *Server) handleLossNotice(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodPost {
+		s.errorResponse(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	q := r.URL.Query()
+	campaignID := q.Get("campaign_id")
+	reason := q.Get("reason")
+
+	s.logger.Debug("loss notice",
+		zap.String("imp_id", q.Get("imp_id")),
+		zap.String("price", q.Get("price")),
+		zap.String("campaign_id", campaignID),
+		zap.String("reason", reason),
+	)
+
+	if s.metrics != nil && campaignID != "" {
+		s.metrics.RecordLoss(campaignID, reason)
+	}
+
+	w.Header().Set("Content-Type", "text/plain")
+	w.Write([]byte("OK"))
 }
 
 // ---- Campaigns CRUD ----
@@ -204,7 +322,6 @@ func (s *Server) handleCampaignByID(w http.ResponseWriter, r *http.Request) {
 		s.jsonResponse(w, c)
 
 	case http.MethodDelete:
-		// TODO: Implement delete
 		s.errorResponse(w, "not implemented", http.StatusNotImplemented)
 
 	default:
@@ -438,7 +555,106 @@ func (s *Server) handleCreativeUpload(w http.ResponseWriter, r *http.Request) {
 	s.jsonResponse(w, map[string]string{"path": "/" + destPath})
 }
 
-// ---- Statistics ----
+// ---- Reporting ----
+
+func (s *Server) handleCampaignReports(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodPost {
+		s.errorResponse(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	if s.reportingService == nil {
+		s.errorResponse(w, "reporting not available", http.StatusServiceUnavailable)
+		return
+	}
+
+	var filter dsp.ReportFilter
+	if r.Method == http.MethodPost {
+		if err := json.NewDecoder(r.Body).Decode(&filter); err != nil {
+			s.errorResponse(w, "invalid json", http.StatusBadRequest)
+			return
+		}
+	}
+
+	stats, err := s.reportingService.GetCampaignStats(r.Context(), filter)
+	if err != nil {
+		s.logger.Error("failed to get campaign stats", zap.Error(err))
+		s.errorResponse(w, "failed to get stats", http.StatusInternalServerError)
+		return
+	}
+
+	s.jsonResponse(w, stats)
+}
+
+func (s *Server) handleLineItemReports(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodPost {
+		s.errorResponse(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	if s.reportingService == nil {
+		s.errorResponse(w, "reporting not available", http.StatusServiceUnavailable)
+		return
+	}
+
+	var filter dsp.ReportFilter
+	if r.Method == http.MethodPost {
+		if err := json.NewDecoder(r.Body).Decode(&filter); err != nil {
+			s.errorResponse(w, "invalid json", http.StatusBadRequest)
+			return
+		}
+	}
+
+	stats, err := s.reportingService.GetLineItemStats(r.Context(), filter)
+	if err != nil {
+		s.logger.Error("failed to get line item stats", zap.Error(err))
+		s.errorResponse(w, "failed to get stats", http.StatusInternalServerError)
+		return
+	}
+
+	s.jsonResponse(w, stats)
+}
+
+func (s *Server) handleTimeSeriesReport(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		s.errorResponse(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	if s.reportingService == nil {
+		s.errorResponse(w, "reporting not available", http.StatusServiceUnavailable)
+		return
+	}
+
+	campaignID := r.URL.Query().Get("campaign_id")
+	if campaignID == "" {
+		s.errorResponse(w, "campaign_id required", http.StatusBadRequest)
+		return
+	}
+
+	filter := dsp.ReportFilter{}
+	if startStr := r.URL.Query().Get("start_date"); startStr != "" {
+		if t, err := time.Parse("2006-01-02", startStr); err == nil {
+			filter.StartDate = t
+		}
+	}
+	if endStr := r.URL.Query().Get("end_date"); endStr != "" {
+		if t, err := time.Parse("2006-01-02", endStr); err == nil {
+			filter.EndDate = t
+		}
+	}
+
+	points, err := s.reportingService.GetTimeSeries(r.Context(), campaignID, filter)
+	if err != nil {
+		s.logger.Error("failed to get time series", zap.Error(err))
+		s.errorResponse(w, "failed to get time series", http.StatusInternalServerError)
+		return
+	}
+
+	s.jsonResponse(w, points)
+}
+
+// ---- Stats (backward compatibility) ----
 
 func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
@@ -446,7 +662,12 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	stats, err := s.statsService.AggregateByCampaign()
+	if s.reportingService == nil {
+		s.jsonResponse(w, []dsp.CampaignStats{})
+		return
+	}
+
+	stats, err := s.reportingService.GetCampaignStats(context.Background(), dsp.ReportFilter{})
 	if err != nil {
 		s.errorResponse(w, "failed to compute stats", http.StatusInternalServerError)
 		return
@@ -461,6 +682,29 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		stats = filtered
+	}
+
+	s.jsonResponse(w, stats)
+}
+
+// ---- Pacing ----
+
+func (s *Server) handlePacingStats(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		s.errorResponse(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	lineItemID := strings.TrimPrefix(r.URL.Path, "/pacing/")
+	if lineItemID == "" {
+		s.errorResponse(w, "line_item_id required", http.StatusBadRequest)
+		return
+	}
+
+	stats, err := s.pacingEngine.GetStats(lineItemID)
+	if err != nil {
+		s.errorResponse(w, "failed to get pacing stats: "+err.Error(), http.StatusInternalServerError)
+		return
 	}
 
 	s.jsonResponse(w, stats)
@@ -496,6 +740,10 @@ func (s *Server) handleClick(w http.ResponseWriter, r *http.Request) {
 		zap.String("campaign_id", campaignID),
 	)
 
+	if s.metrics != nil {
+		s.metrics.RecordClick(campaignID, lineItemID)
+	}
+
 	http.Redirect(w, r, redirectURL, http.StatusFound)
 }
 
@@ -527,42 +775,13 @@ func (s *Server) handleConversion(w http.ResponseWriter, r *http.Request) {
 		s.logger.Error("conversion error", zap.Error(err))
 	}
 
-	w.Header().Set("Content-Type", "text/plain")
-	w.Write([]byte("OK"))
-}
-
-// ---- Win/Loss Notifications ----
-
-func (s *Server) handleWinNotice(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet && r.Method != http.MethodPost {
-		s.errorResponse(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
+	// Record conversion metric
+	if s.metrics != nil {
+		revenue := 0.0
+		fmt.Sscanf(revenueStr, "%f", &revenue)
+		// Would need to look up campaign from click
+		s.metrics.RecordConversion("", eventName, revenue)
 	}
-
-	q := r.URL.Query()
-	s.logger.Info("win notice",
-		zap.String("imp_id", q.Get("imp_id")),
-		zap.String("price", q.Get("price")),
-		zap.String("bid_id", q.Get("bid_id")),
-		zap.String("campaign_id", q.Get("campaign_id")),
-		zap.String("line_item_id", q.Get("line_item_id")),
-	)
-
-	w.Header().Set("Content-Type", "text/plain")
-	w.Write([]byte("OK"))
-}
-
-func (s *Server) handleLossNotice(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet && r.Method != http.MethodPost {
-		s.errorResponse(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	q := r.URL.Query()
-	s.logger.Debug("loss notice",
-		zap.String("imp_id", q.Get("imp_id")),
-		zap.String("price", q.Get("price")),
-	)
 
 	w.Header().Set("Content-Type", "text/plain")
 	w.Write([]byte("OK"))
